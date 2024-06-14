@@ -116,6 +116,9 @@ DocumentManager::DocumentManager(QObject *parent)
     connect(mFileChangedWarning, &FileChangedWarning::reload, this, &DocumentManager::reloadCurrentDocument);
     connect(mFileChangedWarning, &FileChangedWarning::ignore, this, &DocumentManager::hideChangedWarning);
 
+    connect(this, &DocumentManager::templateTilesetReplaced,
+            mBrokenLinksModel, &BrokenLinksModel::refresh);
+
     QVBoxLayout *vertical = new QVBoxLayout(mWidget);
     vertical->addWidget(mTabBar);
     vertical->addWidget(mFileChangedWarning);
@@ -170,7 +173,7 @@ DocumentManager::DocumentManager(QObject *parent)
     JumpToObject::activated = [this] (const JumpToObject &jump) {
         if (auto mapDocument = openMapFile(jump.mapFile)) {
             if (auto object = mapDocument->map()->findObjectById(jump.objectId)) {
-                mapDocument->focusMapObjectRequested(object);
+                emit mapDocument->focusMapObjectRequested(object);
                 mapDocument->setSelectedObjects({ object });
             }
         }
@@ -206,7 +209,7 @@ DocumentManager::DocumentManager(QObject *parent)
                 break;
             case Object::MapObjectType:
                 if (auto object = mapDocument->map()->findObjectById(select.id)) {
-                    mapDocument->focusMapObjectRequested(object);
+                    emit mapDocument->focusMapObjectRequested(object);
                     mapDocument->setSelectedObjects({ object });
                     obj = object;
                 }
@@ -353,7 +356,7 @@ void DocumentManager::restoreState()
 }
 
 /**
- * Returns the current map document, or 0 when there is none.
+ * Returns the current document, or nullptr when there is none.
  */
 Document *DocumentManager::currentDocument() const
 {
@@ -382,7 +385,7 @@ MapView *DocumentManager::viewForDocument(MapDocument *mapDocument) const
 }
 
 /**
- * Searches for a document with the given \a fileName and returns its
+ * Searches for an open document with the given \a fileName and returns its
  * index. Returns -1 when the document isn't open.
  */
 int DocumentManager::findDocument(const QString &fileName) const
@@ -567,19 +570,20 @@ int DocumentManager::insertDocument(int index, const DocumentPtr &document)
         }
     }
 
-    if (!document->fileName().isEmpty())
-        mFileSystemWatcher->addPath(document->fileName());
-
     if (Editor *editor = mEditorForType.value(document->type()))
         editor->addDocument(documentPtr);
 
-    mTabBar->insertTab(index, QString());
-    updateDocumentTab(documentPtr);
-
+    // Connect before adding the tab, so that we handle the 'changed' signal
+    // first, since we may be creating TilesetDocument instances for tilesets
+    // used by a reloaded map (design not ideal...).
     connect(documentPtr, &Document::fileNameChanged, this, &DocumentManager::fileNameChanged);
     connect(documentPtr, &Document::modifiedChanged, this, [=] { updateDocumentTab(documentPtr); });
     connect(documentPtr, &Document::isReadOnlyChanged, this, [=] { updateDocumentTab(documentPtr); });
+    connect(documentPtr, &Document::changed, this, &DocumentManager::onDocumentChanged);
     connect(documentPtr, &Document::saved, this, &DocumentManager::onDocumentSaved);
+
+    mTabBar->insertTab(index, QString());
+    updateDocumentTab(documentPtr);
 
     if (auto *mapDocument = qobject_cast<MapDocument*>(documentPtr)) {
         connect(mapDocument, &MapDocument::tilesetAdded, this, &DocumentManager::tilesetAdded);
@@ -632,7 +636,7 @@ DocumentPtr DocumentManager::loadDocument(const QString &fileName,
 {
     // Try to find it in already loaded documents
     QString canonicalFilePath = QFileInfo(fileName).canonicalFilePath();
-    if (Document *doc = Document::documentInstances().value(canonicalFilePath))
+    if (Document *doc = mDocumentByFileName.value(canonicalFilePath))
         return doc->sharedFromThis();
 
     if (!fileFormat) {
@@ -824,7 +828,7 @@ void DocumentManager::closeOtherDocuments(int index)
 
     for (int i = mTabBar->count() - 1; i >= 0; --i) {
         if (i != index)
-            documentCloseRequested(i);
+            emit documentCloseRequested(i);
 
         if (!mMultiDocumentClose)
             return;
@@ -842,7 +846,7 @@ void DocumentManager::closeDocumentsToRight(int index)
     mMultiDocumentClose = true;
 
     for (int i = mTabBar->count() - 1; i > index; --i) {
-        documentCloseRequested(i);
+        emit documentCloseRequested(i);
 
         if (!mMultiDocumentClose)
             return;
@@ -864,13 +868,10 @@ void DocumentManager::closeDocumentAt(int index)
     mDocuments.removeAt(index);
     mTabBar->removeTab(index);
 
+    document->disconnect(this);
+
     if (Editor *editor = mEditorForType.value(document->type()))
         editor->removeDocument(document.data());
-
-    if (!document->fileName().isEmpty()) {
-        mFileSystemWatcher->removePath(document->fileName());
-        document->setChangedOnDisk(false);
-    }
 
     if (auto mapDocument = qobject_cast<MapDocument*>(document.data())) {
         for (const SharedTileset &tileset : mapDocument->map()->tilesets())
@@ -879,8 +880,6 @@ void DocumentManager::closeDocumentAt(int index)
         if (tilesetDocument->mapDocuments().isEmpty()) {
             mTilesetDocumentsModel->remove(tilesetDocument);
             emit tilesetDocumentRemoved(tilesetDocument);
-        } else {
-            tilesetDocument->disconnect(this);
         }
     }
 
@@ -904,63 +903,66 @@ bool DocumentManager::reloadCurrentDocument()
 }
 
 /**
- * Reloads the document at the given \a index. It will lose any undo
- * history and current selections. Will not ask the user whether to save
- * any changes!
+ * Reloads the document at the given \a index. Will not ask the user whether to
+ * save any changes!
  *
- * Returns whether the document loaded successfully.
+ * Returns whether the document reloaded successfully.
  */
 bool DocumentManager::reloadDocumentAt(int index)
 {
-    const auto oldDocument = mDocuments.at(index);
+    const auto document = mDocuments.at(index);
+    return reloadDocument(document.data());
+}
+
+/**
+ * Reloads the given \a document.
+ *
+ * The document may not actually be open in any editor. It might be a map that
+ * is loaded as part of a world, or a tileset that is loaded as part of a map.
+ *
+ * Returns whether the document reloaded successfully.
+ */
+bool DocumentManager::reloadDocument(Document *document)
+{
     QString error;
 
-    if (auto mapDocument = oldDocument.objectCast<MapDocument>()) {
-        auto readerFormat = mapDocument->readerFormat();
-        if (!readerFormat)
-            return false;
-
-        // TODO: Consider fixing the reload to avoid recreating the MapDocument
-        auto newDocument = MapDocument::load(oldDocument->fileName(),
-                                             readerFormat,
-                                             &error);
-        if (!newDocument) {
-            emit reloadError(tr("%1:\n\n%2").arg(oldDocument->fileName(), error));
+    if (auto mapDocument = qobject_cast<MapDocument*>(document)) {
+        if (!mapDocument->reload(&error)) {
+            emit reloadError(tr("%1:\n\n%2").arg(document->fileName(), error));
             return false;
         }
 
-        // Save the document state, to ensure the new document will match it
-        static_cast<MapEditor*>(editor(Document::MapDocumentType))->saveDocumentState(mapDocument.data());
-
-        // Replace old tab
-        const bool isCurrent = index == mTabBar->currentIndex();
-        insertDocument(index, newDocument);
+        const bool isCurrent = document == currentDocument();
         if (isCurrent) {
-            switchToDocument(index);
-
             if (mBrokenLinksModel->hasBrokenLinks())
                 mBrokenLinksWidget->show();
         }
-        closeDocumentAt(index + 1);
 
-        checkTilesetColumns(newDocument.data());
+        // Only check tileset columns for open maps since for other maps we
+        // may not have TilesetDocument instances created for their tilesets.
+        if (findDocument(document) != -1)
+            checkTilesetColumns(mapDocument);
 
-    } else if (auto tilesetDocument = qobject_cast<TilesetDocument*>(oldDocument)) {
+    } else if (auto tilesetDocument = qobject_cast<TilesetDocument*>(document)) {
         if (tilesetDocument->isEmbedded()) {
             // For embedded tilesets, we need to reload the map
-            index = findDocument(tilesetDocument->mapDocuments().first());
-            if (!reloadDocumentAt(index))
+            if (!reloadDocument(tilesetDocument->mapDocuments().first()))
                 return false;
         } else if (!tilesetDocument->reload(&error)) {
-            emit reloadError(tr("%1:\n\n%2").arg(oldDocument->fileName(), error));
+            emit reloadError(tr("%1:\n\n%2").arg(document->fileName(), error));
             return false;
         }
 
         tilesetDocument->setChangedOnDisk(false);
+    } else {
+        // We don't support reloading other document types at the moment
+        return false;
     }
 
     if (!isDocumentChangedOnDisk(currentDocument()))
         mFileChangedWarning->setVisible(false);
+
+    emit documentReloaded(document);
 
     return true;
 }
@@ -995,16 +997,12 @@ void DocumentManager::currentIndexChanged()
     emit currentDocumentChanged(document);
 }
 
-void DocumentManager::fileNameChanged(const QString &fileName,
-                                      const QString &oldFileName)
+void DocumentManager::fileNameChanged(const QString &/* fileName */,
+                                      const QString &/* oldFileName */)
 {
-    if (!fileName.isEmpty())
-        mFileSystemWatcher->addPath(fileName);
-    if (!oldFileName.isEmpty())
-        mFileSystemWatcher->removePath(oldFileName);
+    Document *document = static_cast<Document*>(sender());
 
     // Update the tabs for all opened embedded tilesets
-    Document *document = static_cast<Document*>(sender());
     if (MapDocument *mapDocument = qobject_cast<MapDocument*>(document)) {
         for (const SharedTileset &tileset : mapDocument->map()->tilesets()) {
             if (auto tilesetDocument = findTilesetDocument(tileset))
@@ -1033,6 +1031,27 @@ void DocumentManager::updateDocumentTab(Document *document)
     mTabBar->setTabIcon(index, tabIcon);
     mTabBar->setTabText(index, tabText);
     mTabBar->setTabToolTip(index, tabToolTip);
+}
+
+void DocumentManager::onDocumentChanged(const ChangeEvent &event)
+{
+    auto mapDocument = qobject_cast<MapDocument*>(sender());
+    if (!mapDocument)
+        return;
+
+    // In case a map is reloaded, the set of used tilesets might have changed
+    switch (event.type) {
+    case ChangeEvent::DocumentAboutToReload:
+        for (const SharedTileset &tileset : mapDocument->map()->tilesets())
+            removeFromTilesetDocument(tileset, mapDocument);
+        break;
+    case ChangeEvent::DocumentReloaded:
+        for (const SharedTileset &tileset : mapDocument->map()->tilesets())
+            addToTilesetDocument(tileset, mapDocument);
+        break;
+    default:
+        break;
+    }
 }
 
 void DocumentManager::onDocumentSaved()
@@ -1115,13 +1134,12 @@ void DocumentManager::filesChanged(const QStringList &fileNames)
 
 void DocumentManager::fileChanged(const QString &fileName)
 {
-    const int index = findDocument(fileName);
-
-    // Most likely the file was removed
-    if (index == -1)
+    const auto document = mDocumentByFileName.value(fileName);
+    if (!document) {
+        qWarning() << "Document not found for changed file:" << fileName;
         return;
+    }
 
-    const auto &document = mDocuments.at(index);
     const QFileInfo fileInfo { fileName };
 
     // Always update potentially changed read-only state
@@ -1132,8 +1150,8 @@ void DocumentManager::fileChanged(const QString &fileName)
         return;
 
     // Automatically reload when there are no unsaved changes
-    if (!isDocumentModified(document.data())) {
-        reloadDocumentAt(index);
+    if (!isDocumentModified(document)) {
+        reloadDocument(document);
         return;
     }
 
@@ -1255,6 +1273,38 @@ TilesetDocument *DocumentManager::openTilesetFile(const QString &path)
     openFile(path);
     const int i = findDocument(path);
     return i == -1 ? nullptr : qobject_cast<TilesetDocument*>(mDocuments.at(i).data());
+}
+
+void DocumentManager::registerDocument(Document *document)
+{
+    const QString &canonicalPath = document->canonicalFilePath();
+    if (canonicalPath.isEmpty())
+        return;
+
+    // Always add path because FileSystemWatcher handles duplicates
+    mFileSystemWatcher->addPath(canonicalPath);
+
+    const auto i = mDocumentByFileName.constFind(canonicalPath);
+    if (i != mDocumentByFileName.constEnd()) {
+        qWarning() << "Document already registered:" << canonicalPath;
+        return;
+    }
+
+    mDocumentByFileName.insert(canonicalPath, document);
+}
+
+void DocumentManager::unregisterDocument(Document *document)
+{
+    const QString &canonicalPath = document->canonicalFilePath();
+    if (canonicalPath.isEmpty())
+        return;
+
+    // Always remove path because FileSystemWatcher handles duplicates
+    mFileSystemWatcher->removePath(canonicalPath);
+
+    const auto i = mDocumentByFileName.constFind(canonicalPath);
+    if (i != mDocumentByFileName.constEnd() && *i == document)
+        mDocumentByFileName.erase(i);
 }
 
 WorldDocument *DocumentManager::ensureWorldDocument(const QString &fileName)
